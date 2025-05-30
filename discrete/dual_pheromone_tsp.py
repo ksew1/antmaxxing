@@ -105,40 +105,37 @@ class DualPheromoneACO(Algorithm):
         return self._best_solution
 
     def construct_solution(self) -> PermutationSolution:
-        unvisited = list(range(self.n))
-        current = np.random.choice(unvisited, size=1)[0]
-        tour = [current]
-        unvisited.remove(int(current))
+        tour = []
+        n = self.n
+        current = np.random.randint(n)
+        tour.append(current)
 
-        while unvisited:
+        visited = np.zeros(n, dtype=bool)
+        visited[current] = True
+
+        while len(tour) < n:
+            unvisited_mask = ~visited
+            unvisited_indices = np.flatnonzero(unvisited_mask)
+
             if np.random.random() < self.exploration_rate:
-                # Eksploracja: wybór preferujący słaby negatywny feromon
-                neg_values = np.array([
-                    self.tau_neg[current][j] for j in unvisited
-                ])
-                # Zamieniamy na "atrakcyjność": im mniejszy negatywny, tym lepiej
-                attractiveness = 1.0 / (1e-6 + neg_values)  # +epsilon by uniknąć dzielenia przez zero
-                attractiveness /= attractiveness.sum()
-                next_city = np.random.choice(unvisited, p=attractiveness)
+                # Eksploracja: preferuj mały negatywny feromon
+                tau_neg_row = self.tau_neg[current, unvisited_mask]
+                attractiveness = 1.0 / (1e-6 + tau_neg_row)
+                probs = attractiveness / attractiveness.sum()
+                next_city = np.random.choice(unvisited_indices, p=probs)
             else:
-                # Eksploatacja: klasyczny wybór ze wzorem z tau_pos, eta, tau_neg
-                probs = []
-                for j in unvisited:
-                    tau = self.tau_pos[current][j] ** self.alpha
-                    # eta = (1 / np.linalg.norm(
-                    #     self.problem.coordinates[current] - self.problem.coordinates[j])) ** self.beta
-                    eta = (1 / self.distance_matrix[current, j]) ** self.beta
-                    psi = (1 + self.tau_neg[current][j]) ** self.gamma
-                    probs.append((tau * eta) / psi)
-                probs = np.array(probs)
+                tau_pos_row = self.tau_pos[current, unvisited_mask] ** self.alpha
+                eta_row = (1.0 / self.distance_matrix[current, unvisited_mask]) ** self.beta
+                psi_row = (1.0 + self.tau_neg[current, unvisited_mask]) ** self.gamma
+                probs = (tau_pos_row * eta_row) / psi_row
                 probs /= probs.sum()
-                next_city = np.random.choice(unvisited, p=probs)
+                next_city = np.random.choice(unvisited_indices, p=probs)
 
             tour.append(next_city)
-            unvisited.remove(next_city)
+            visited[next_city] = True
             current = next_city
 
-        solution = PermutationSolution(number_of_variables=self.n, number_of_objectives=1)
+        solution = PermutationSolution(number_of_variables=n, number_of_objectives=1)
         solution.variables = tour
         return solution
 
@@ -448,3 +445,5 @@ if __name__ == '__main__':
 
     dual_aco.plot_pheromone_matrices()
     dual_aco.plot_pheromone_city_map(20, 20)
+
+
