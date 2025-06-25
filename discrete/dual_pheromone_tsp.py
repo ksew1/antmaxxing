@@ -9,27 +9,70 @@ from typing import List
 
 from discrete.tsp_problem import TSPProblem
 
+import numpy as np
+from typing import List, Set, Tuple, Dict, Optional
+from dataclasses import dataclass
+from enum import Enum
+
+
+class ExplorationDecayType(Enum):
+    """Typy strategii zmniejszania exploration_rate"""
+    NONE = "none"  # Brak zmniejszania
+    LINEAR = "linear"  # Liniowe zmniejszanie
+    EXPONENTIAL = "exponential"  # Wykładnicze zmniejszanie
+    INVERSE = "inverse"  # Odwrotnie proporcjonalne
+
+
+@dataclass
+class PheromoneConfig:
+    """Konfiguracja parametrów feromonowych"""
+    min_pheromone: float = 1e-6  # Minimalna wartość feromonu (wcześniej hardcoded)
+    pheromone_reward_factor: float = 100.0  # Czynnik nagrody feromonowej
+    negative_pheromone_scaling: float = 0.1  # Skalowanie negatywnego feromonu
+
+
+@dataclass
+class ExplorationConfig:
+    """Konfiguracja strategii eksploracji"""
+    initial_rate: float = 0.1  # Początkowy wskaźnik eksploracji
+    final_rate: float = 0.01  # Końcowy wskaźnik eksploracji
+    decay_type: ExplorationDecayType = ExplorationDecayType.LINEAR
+    decay_start_iteration: int = 0  # Od której iteracji zaczynać zmniejszanie
+    decay_factor: float = 0.95  # Czynnik dla decay wykładniczego (0 < decay_factor < 1)
+
 
 class DualPheromoneACO(Algorithm):
+    """
+    Algorytm Dual Pheromone Ant Colony Optimization dla problemu TSP.
+
+    Wykorzystuje pozytywne i negatywne feromony do kierowania eksploracją
+    i eksploatacją w przestrzeni rozwiązań.
+    """
+
     def get_name(self) -> str:
         return "Dual Pheromone ACO"
 
     def __init__(self,
                  problem: TSPProblem,
-                 n_ants=10,
-                 n_iterations=100,
-                 alpha=1.0,
-                 beta=2.0,
-                 gamma=2.0,
-                 rho_pos=0.1,
-                 rho_neg=0.1,
-                 n_reinforce=2,
-                 elite_boost=False,
-                 exploration_rate=0.1):
+                 n_ants: int = 10,
+                 n_iterations: int = 100,
+                 alpha: float = 1.0,  # Wpływ pozytywnego feromonu
+                 beta: float = 2.0,  # Wpływ heurystyki odległości
+                 gamma: float = 2.0,  # Wpływ negatywnego feromonu
+                 rho_pos: float = 0.1,  # Współczynnik parowania pozytywnego feromonu
+                 rho_neg: float = 0.1,  # Współczynnik parowania negatywnego feromonu
+                 n_reinforce: int = 2,  # Liczba najlepszych/najgorszych rozwiązań do wzmocnienia
+                 elite_boost: bool = False,  # Czy stosować dodatkowe wzmocnienie dla najlepszego
+                 exploration_rate: float = 0.1,  # Prawdopodobieństwo eksploracji (używane gdy exploration_config=None)
+                 pheromone_config: Optional[PheromoneConfig] = None,
+                 exploration_config: Optional[ExplorationConfig] = None):
+
         super().__init__()
         self.problem = problem
         self.n_ants = n_ants
         self.max_iterations = n_iterations
+
+        # Parametry algorytmu
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
@@ -37,63 +80,108 @@ class DualPheromoneACO(Algorithm):
         self.rho_neg = rho_neg
         self.n_reinforce = n_reinforce
         self.elite_boost = elite_boost
-        self.exploration_rate = exploration_rate
 
+        # Konfiguracja eksploracji
+        self.exploration_config = exploration_config
+        if exploration_config is None:
+            # Używamy stałego exploration_rate jeśli nie podano konfiguracji
+            self.current_exploration_rate = exploration_rate
+        else:
+            self.current_exploration_rate = exploration_config.initial_rate
+
+        # Konfiguracja feromonów
+        self.pheromone_config = pheromone_config or PheromoneConfig()
+
+        # Inicjalizacja struktur danych
         self.n = problem.number_of_variables()
-        self.tau_pos = np.ones((self.n, self.n))
-        self.tau_neg = np.zeros((self.n, self.n))
-        self.distance_matrix = self.compute_distance_matrix()
+        self._initialize_pheromones()
+        self._precompute_distance_matrix()
 
+        # Stan algorytmu
         self.observable = DefaultObservable()
+        self._reset_state()
+
+    def _initialize_pheromones(self) -> None:
+        """Inicjalizuje macierze feromonów"""
+        self.tau_pos = np.ones((self.n, self.n), dtype=np.float32)
+        self.tau_neg = np.zeros((self.n, self.n), dtype=np.float32)
+
+    def _precompute_distance_matrix(self) -> None:
+        """Prekompiluje macierz odległości dla optymalizacji"""
+        coords = self.problem.coordinates
+        n = len(coords)
+        self.distance_matrix = np.zeros((n, n), dtype=np.float32)
+
+        # Wykorzystanie wektoryzacji NumPy dla szybszego obliczania
+        for i in range(n):
+            diff = coords - coords[i]  # Broadcasting
+            distances = np.linalg.norm(diff, axis=1)
+            self.distance_matrix[i] = distances
+
+        # Unikanie dzielenia przez zero
+        np.fill_diagonal(self.distance_matrix, np.inf)
+
+    def _reset_state(self) -> None:
+        """Resetuje stan algorytmu"""
         self.iteration = 0
         self.evaluations = 0
         self._best_solution = None
         self.convergence_history = []
-
-    def compute_distance_matrix(self):
-        coords = self.problem.coordinates
-        n = len(coords)
-        matrix = np.zeros((n, n))
-        for i in range(n):
-            for j in range(n):
-                if i != j:
-                    matrix[i][j] = np.linalg.norm(coords[i] - coords[j])
-        return matrix
+        # Reset exploration rate do wartości początkowej
+        if self.exploration_config is not None:
+            self.current_exploration_rate = self.exploration_config.initial_rate
 
     def create_initial_solutions(self) -> List[PermutationSolution]:
-        return [self.construct_solution() for _ in range(self.n_ants)]
+        """Tworzy początkowe rozwiązania"""
+        return [self._construct_solution() for _ in range(self.n_ants)]
 
     def evaluate(self, solution_list: List[PermutationSolution]) -> List[PermutationSolution]:
+        """Ewaluuje listę rozwiązań"""
         return [self.problem.evaluate(solution) for solution in solution_list]
 
     def init_progress(self) -> None:
-        self.iteration = 0
-        self.evaluations = 0
-        self.convergence_history = []
+        """Inicjalizuje postęp algorytmu"""
+        self._reset_state()
         self.observable.notify_all(self.observable_data())
 
     def stopping_condition_is_met(self) -> bool:
+        """Sprawdza czy warunek stopu został spełniony"""
         return self.iteration >= self.max_iterations
 
     def step(self) -> None:
-        solutions = [self.construct_solution() for _ in range(self.n_ants)]
-        evaluated = self.evaluate(solutions)
-        self.evaluations += len(evaluated)
+        """Wykonuje jeden krok algorytmu"""
+        # Konstruuj i ewaluuj rozwiązania
+        solutions = [self._construct_solution() for _ in range(self.n_ants)]
+        evaluated_solutions = self.evaluate(solutions)
+        self.evaluations += len(evaluated_solutions)
 
-        for s in evaluated:
-            if self._best_solution is None or s.objectives[0] < self._best_solution.objectives[0]:
-                self._best_solution = s
+        # Aktualizuj najlepsze rozwiązanie
+        self._update_best_solution(evaluated_solutions)
 
-        self.update_pheromones(evaluated)
+        # Aktualizuj feromony
+        self._update_pheromones(evaluated_solutions)
+
+        # Aktualizuj exploration rate
+        self._update_exploration_rate()
+
+        # Aktualizuj stan
         self.iteration += 1
-
         if self._best_solution:
             self.convergence_history.append(self._best_solution.objectives[0])
 
+    def _update_best_solution(self, solutions: List[PermutationSolution]) -> None:
+        """Aktualizuje najlepsze rozwiązanie"""
+        for solution in solutions:
+            if (self._best_solution is None or
+                    solution.objectives[0] < self._best_solution.objectives[0]):
+                self._best_solution = solution
+
     def update_progress(self) -> None:
+        """Aktualizuje postęp dla obserwatorów"""
         self.observable.notify_all(self.observable_data())
 
-    def observable_data(self) -> dict:
+    def observable_data(self) -> Dict:
+        """Zwraca dane dla obserwatorów"""
         return {
             "ITERATION": self.iteration,
             "EVALUATIONS": self.evaluations,
@@ -102,108 +190,211 @@ class DualPheromoneACO(Algorithm):
         }
 
     def result(self) -> PermutationSolution:
+        """Zwraca najlepsze znalezione rozwiązanie"""
         return self._best_solution
 
-    def construct_solution(self) -> PermutationSolution:
+    def _construct_solution(self) -> PermutationSolution:
+        """
+        Konstruuje pojedyncze rozwiązanie używając strategii dual pheromone
+        """
         tour = []
         n = self.n
-        current = np.random.randint(n)
-        tour.append(current)
+        current_city = np.random.randint(n)
+        tour.append(current_city)
 
         visited = np.zeros(n, dtype=bool)
-        visited[current] = True
+        visited[current_city] = True
 
         while len(tour) < n:
             unvisited_mask = ~visited
             unvisited_indices = np.flatnonzero(unvisited_mask)
 
-            if np.random.random() < self.exploration_rate:
-                # Eksploracja: preferuj mały negatywny feromon
-                tau_neg_row = self.tau_neg[current, unvisited_mask]
-                attractiveness = 1.0 / (1e-6 + tau_neg_row)
-                probs = attractiveness / attractiveness.sum()
-                next_city = np.random.choice(unvisited_indices, p=probs)
+            if np.random.random() < self.current_exploration_rate:
+                next_city = self._exploration_selection(current_city, unvisited_mask, unvisited_indices)
             else:
-                tau_pos_row = self.tau_pos[current, unvisited_mask] ** self.alpha
-                eta_row = (1.0 / self.distance_matrix[current, unvisited_mask]) ** self.beta
-                psi_row = (1.0 + self.tau_neg[current, unvisited_mask]) ** self.gamma
-                probs = (tau_pos_row * eta_row) / psi_row
-                probs /= probs.sum()
-                next_city = np.random.choice(unvisited_indices, p=probs)
+                next_city = self._exploitation_selection(current_city, unvisited_mask, unvisited_indices)
 
             tour.append(next_city)
             visited[next_city] = True
-            current = next_city
+            current_city = next_city
 
-        solution = PermutationSolution(number_of_variables=n, number_of_objectives=1)
+        return self._create_solution_from_tour(tour)
+
+    def _exploration_selection(self, current: int, unvisited_mask: np.ndarray,
+                               unvisited_indices: np.ndarray) -> int:
+        """Selekcja w trybie eksploracji - preferuje niski negatywny feromon"""
+        tau_neg_values = self.tau_neg[current, unvisited_mask]
+        attractiveness = 1.0 / (self.pheromone_config.min_pheromone + tau_neg_values)
+        probabilities = attractiveness / attractiveness.sum()
+        return np.random.choice(unvisited_indices, p=probabilities)
+
+    def _exploitation_selection(self, current: int, unvisited_mask: np.ndarray,
+                                unvisited_indices: np.ndarray) -> int:
+        """Selekcja w trybie eksploatacji - używa pozytywnego feromonu i heurystyki"""
+        tau_pos_values = self.tau_pos[current, unvisited_mask] ** self.alpha
+        eta_values = (1.0 / self.distance_matrix[current, unvisited_mask]) ** self.beta
+        psi_values = (1.0 + self.tau_neg[current, unvisited_mask]) ** self.gamma
+
+        probabilities = (tau_pos_values * eta_values) / psi_values
+        probabilities /= probabilities.sum()
+
+        return np.random.choice(unvisited_indices, p=probabilities)
+
+    def _create_solution_from_tour(self, tour: List[int]) -> PermutationSolution:
+        """Tworzy obiekt rozwiązania z trasy"""
+        solution = PermutationSolution(
+            number_of_variables=self.n,
+            number_of_objectives=1
+        )
         solution.variables = tour
         return solution
 
-    def update_pheromones(self, solutions: List[PermutationSolution]):
+    def _update_pheromones(self, solutions: List[PermutationSolution]) -> None:
+        """
+        Aktualizuje macierze feromonów na podstawie jakości rozwiązań
+        """
+        # Parowanie feromonów
         self.tau_pos *= (1 - self.rho_pos)
         self.tau_neg *= (1 - self.rho_neg)
 
+        # Sortowanie rozwiązań według jakości
         solutions.sort(key=lambda s: s.objectives[0])
-        good = solutions[:self.n_reinforce]
-        bad = solutions[-self.n_reinforce:]
 
-        # Zbierz krawędzie z najlepszych rozwiązań
-        good_edges = set()
-        for s in good:
+        good_solutions = solutions[:self.n_reinforce]
+        bad_solutions = solutions[-self.n_reinforce:]
+
+        # Pozytywne wzmocnienie
+        self._apply_positive_reinforcement(good_solutions)
+
+        # Negatywne wzmocnienie
+        self._apply_negative_reinforcement(good_solutions, bad_solutions)
+
+    def _apply_positive_reinforcement(self, good_solutions: List[PermutationSolution]) -> None:
+        """Stosuje pozytywne wzmocnienie dla dobrych rozwiązań"""
+        for solution in good_solutions:
+            delta = self.pheromone_config.pheromone_reward_factor / solution.objectives[0]
+            self._reinforce_solution_edges(solution, self.tau_pos, delta)
+
+        # Elite boost dla najlepszego rozwiązania
+        if self.elite_boost and good_solutions:
+            best_solution = good_solutions[0]
+            elite_delta = self.pheromone_config.pheromone_reward_factor / best_solution.objectives[0]
+            self._reinforce_solution_edges(best_solution, self.tau_pos, elite_delta)
+
+    def _apply_negative_reinforcement(self, good_solutions: List[PermutationSolution],
+                                      bad_solutions: List[PermutationSolution]) -> None:
+        """Stosuje negatywne wzmocnienie dla złych krawędzi"""
+        good_edges = self._extract_edges_from_solutions(good_solutions)
+        bad_edge_stats = self._analyze_bad_edges(bad_solutions, good_edges)
+
+        if not bad_edge_stats:
+            return
+
+        max_count = max(stats['count'] for stats in bad_edge_stats.values())
+
+        for edge, stats in bad_edge_stats.items():
+            frequency_factor = stats['count'] / max_count
+            avg_quality = stats['total_quality'] / stats['count']
+
+            delta = (frequency_factor * (1 / avg_quality) *
+                     self.pheromone_config.negative_pheromone_scaling)
+
+            a, b = edge
+            self.tau_neg[a, b] += delta
+            self.tau_neg[b, a] += delta
+
+    def _extract_edges_from_solutions(self, solutions: List[PermutationSolution]) -> Set[Tuple[int, int]]:
+        """Wyciąga krawędzie z listy rozwiązań"""
+        edges = set()
+        for solution in solutions:
             for i in range(self.n):
-                a, b = s.variables[i], s.variables[(i + 1) % self.n]
-                # Dodaj krawędź w obu kierunkach (symetryczna)
-                good_edges.add((min(a, b), max(a, b)))
+                a, b = solution.variables[i], solution.variables[(i + 1) % self.n]
+                edges.add((min(a, b), max(a, b)))
+        return edges
 
-        # Standard reinforcement for good solutions
-        for s in good:
+    def _analyze_bad_edges(self, bad_solutions: List[PermutationSolution],
+                           good_edges: Set[Tuple[int, int]]) -> Dict[Tuple[int, int], Dict]:
+        """Analizuje statystyki złych krawędzi"""
+        bad_edge_stats = {}
+
+        for solution in bad_solutions:
+            solution_quality = self.pheromone_config.pheromone_reward_factor / solution.objectives[0]
+
             for i in range(self.n):
-                a, b = s.variables[i], s.variables[(i + 1) % self.n]
-                delta = 100 / s.objectives[0]
-                self.tau_pos[a][b] += delta
-                self.tau_pos[b][a] += delta
-
-        # Elite boost for the best solution if enabled
-        if self.elite_boost and good:
-            best_solution = good[0]  # Already sorted, so first is best
-            for i in range(self.n):
-                a, b = best_solution.variables[i], best_solution.variables[(i + 1) % self.n]
-                elite_delta = 100 / best_solution.objectives[0]
-                self.tau_pos[a][b] += elite_delta
-                self.tau_pos[b][a] += elite_delta
-
-        # Negative reinforcement - tylko dla krawędzi NIE występujących w dobrych rozwiązaniach
-        # Zliczamy wystąpienia każdej krawędzi w złych rozwiązaniach
-        bad_edge_count = {}
-        bad_edge_quality = {}
-
-        for s in bad:
-            solution_quality = 100 / s.objectives[0]  # Im gorsza trasa, tym mniejsza wartość
-            for i in range(self.n):
-                a, b = s.variables[i], s.variables[(i + 1) % self.n]
+                a, b = solution.variables[i], solution.variables[(i + 1) % self.n]
                 edge = (min(a, b), max(a, b))
 
-                # Tylko jeśli krawędź NIE występuje w dobrych rozwiązaniach
+                # Tylko krawędzie nieobecne w dobrych rozwiązaniach
                 if edge not in good_edges:
-                    if edge not in bad_edge_count:
-                        bad_edge_count[edge] = 0
-                        bad_edge_quality[edge] = 0
-                    bad_edge_count[edge] += 1
-                    bad_edge_quality[edge] += solution_quality
+                    if edge not in bad_edge_stats:
+                        bad_edge_stats[edge] = {'count': 0, 'total_quality': 0}
 
-        # Aktualizuj negatywne feromony proporcjonalnie do częstości i jakości
-        max_count = max(bad_edge_count.values()) if bad_edge_count else 1
+                    bad_edge_stats[edge]['count'] += 1
+                    bad_edge_stats[edge]['total_quality'] += solution_quality
 
-        for edge, count in bad_edge_count.items():
-            a, b = edge
-            avg_quality = bad_edge_quality[edge] / count
-            frequency_factor = count / max_count  # 0-1 normalizacja częstości
+        return bad_edge_stats
 
-            # Delta proporcjonalna do częstości wystąpień i odwrotnie do jakości
-            delta = frequency_factor * (1 / avg_quality) * 0.1  # 0.1 jako scaling factor
+    def _update_exploration_rate(self) -> None:
+        """
+        Aktualizuje exploration_rate zgodnie z wybraną strategią
+        """
+        if self.exploration_config is None:
+            return  # Brak zmian - używamy stałego exploration_rate
 
-            self.tau_neg[a][b] += delta
-            self.tau_neg[b][a] += delta
+        config = self.exploration_config
+
+        # Sprawdź czy już czas zacząć zmniejszanie
+        if self.iteration < config.decay_start_iteration:
+            return
+
+        # Oblicz postęp (0.0 - 1.0)
+        effective_iteration = self.iteration - config.decay_start_iteration
+        effective_max_iterations = self.max_iterations - config.decay_start_iteration
+
+        if effective_max_iterations <= 0:
+            progress = 1.0
+        else:
+            progress = min(1.0, effective_iteration / effective_max_iterations)
+
+        # Zastosuj odpowiednią strategię decay
+        if config.decay_type == ExplorationDecayType.NONE:
+            # Bez zmian
+            pass
+        elif config.decay_type == ExplorationDecayType.LINEAR:
+            self.current_exploration_rate = (
+                    config.initial_rate -
+                    progress * (config.initial_rate - config.final_rate)
+            )
+        elif config.decay_type == ExplorationDecayType.EXPONENTIAL:
+            # Wykładnicze zmniejszanie używając decay_factor
+            self.current_exploration_rate = max(
+                config.final_rate,
+                config.initial_rate * (config.decay_factor ** effective_iteration)
+            )
+        elif config.decay_type == ExplorationDecayType.INVERSE:
+            # Odwrotnie proporcjonalne: rate = initial_rate / (1 + k * iteration)
+            # k dobrane tak, aby przy końcowej iteracji osiągnąć final_rate
+            if effective_max_iterations > 0:
+                k = (config.initial_rate / config.final_rate - 1) / effective_max_iterations
+                self.current_exploration_rate = max(
+                    config.final_rate,
+                    config.initial_rate / (1 + k * effective_iteration)
+                )
+
+        # Zabezpieczenie przed wartościami poza zakresem
+        self.current_exploration_rate = max(0.0, min(1.0, self.current_exploration_rate))
+
+    def get_current_exploration_rate(self) -> float:
+        """Zwraca aktualny exploration_rate"""
+        return self.current_exploration_rate
+
+    def _reinforce_solution_edges(self, solution: PermutationSolution,
+                                  pheromone_matrix: np.ndarray, delta: float) -> None:
+        """Wzmacnia krawędzie w danym rozwiązaniu"""
+        for i in range(self.n):
+            a, b = solution.variables[i], solution.variables[(i + 1) % self.n]
+            pheromone_matrix[a, b] += delta
+            pheromone_matrix[b, a] += delta
 
     def plot_convergence(self):
         """Wykres zbieżności algorytmu"""
@@ -352,7 +543,7 @@ if __name__ == '__main__':
     classic_aco = AntColonyOptimization(
         problem=problem1,
         n_ants=50,
-        n_iterations=10,
+        n_iterations=200,
         alpha=1.0,
         beta=2.0,
         evaporation_rate=0.3,
@@ -365,32 +556,22 @@ if __name__ == '__main__':
     print("Best Tour Length:", best_classic.objectives[0])
     problem1.plot_solution(best_classic)
 
-    # algorithm = DualPheromoneACO(
-    #     problem=problem2,
-    #     n_ants=10,
-    #     n_iterations=100,
-    #     alpha=1.0,
-    #     beta=2.0,
-    #     gamma=2.0,
-    #     rho_pos=0.3,
-    #     rho_neg=0.05,
-    #     n_reinforce=2,
-    #     elite_boost=True,
-    #     exploration_rate=0.1
-    # )
-    # algorithm.init_progress()
-    #
-    # while not algorithm.stopping_condition_is_met():
-    #     algorithm.step()
-    #     algorithm.update_progress()
-    #     if algorithm.iteration % 10 == 0:  # Print every 10 iterations
-    #         print(
-    #             f"Iteration {algorithm.iteration}, Best: {algorithm._best_solution.objectives[0] if algorithm._best_solution else 'None'}")
+    pheromone_config = PheromoneConfig(
+        min_pheromone=1e-6,
+        pheromone_reward_factor=100,
+        negative_pheromone_scaling=0.1
+    )
+
+    exploration_config = ExplorationConfig(
+        initial_rate=0.1,
+        final_rate=0.0,
+        decay_type=ExplorationDecayType.LINEAR
+    )
 
     dual_aco = DualPheromoneACO(
         problem=problem2,
         n_ants=50,
-        n_iterations=10,
+        n_iterations=100,
         alpha=1.0,
         beta=2.0,
         gamma=2.0,
@@ -398,7 +579,8 @@ if __name__ == '__main__':
         rho_neg=0.05,
         n_reinforce=10,
         elite_boost=True,
-        exploration_rate=0.05
+        pheromone_config=pheromone_config,
+        exploration_config=exploration_config,
     )
 
     dual_aco.init_progress()
@@ -412,17 +594,7 @@ if __name__ == '__main__':
     print("Best Tour Length:", best_dual.objectives[0])
     problem2.plot_solution(best_dual)
 
-    dual_aco.plot_convergence()
-
-    # result = algorithm.result()
-    # print("Najlepsza trasa:", result.variables)
-    # print("Długość trasy:", result.objectives[0])
-    # problem2.plot_solution(result)
-    #
-    # algorithm.plot_convergence()
-    # algorithm.plot_pheromone_matrices()
-    # algorithm.plot_pheromone_city_map(20, 20)
-    # algorithm.plot_pheromone_heatmaps()
+    # dual_aco.plot_convergence()
 
     print("\n--- Comparison ---")
     print(f"Classic ACO Tour Length      : {best_classic.objectives[0]:.4f}")
@@ -444,6 +616,4 @@ if __name__ == '__main__':
     plt.show()
 
     dual_aco.plot_pheromone_matrices()
-    dual_aco.plot_pheromone_city_map(20, 20)
-
-
+    # dual_aco.plot_pheromone_city_map(20, 20)

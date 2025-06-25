@@ -42,7 +42,7 @@ class TSPProblem(PermutationProblem):
 
     def plot_solution(self, solution):
         """Plot the TSP tour"""
-        plt.figure(figsize=(10, 6))
+        plt.figure(figsize=(8, 5))
 
         # Plot cities
         x_coords = [self.coordinates[i][0] for i in range(self.number_of_variables())]
